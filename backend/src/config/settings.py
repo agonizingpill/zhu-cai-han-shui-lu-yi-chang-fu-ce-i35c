@@ -3,3 +3,4 @@ DATABASE_URL=os.getenv('DATABASE_URL','postgresql://bamboo:bamboo_dev_password@d
 REDIS_URL=os.getenv('REDIS_URL','redis://redis:6379/0')
 JWT_SECRET=os.getenv('JWT_SECRET','gb1075-demo-secret')
 MIN_SAMPLE_POINTS=4
+INTERNAL_TOKEN=os.getenv('INTERNAL_TOKEN','gb1075-internal')

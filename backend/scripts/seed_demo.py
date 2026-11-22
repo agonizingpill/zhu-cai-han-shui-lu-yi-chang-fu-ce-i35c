@@ -20,6 +20,29 @@ for attempt in range(30):
     for code,reason in [('BZ-604-20261120','seed异常批次，等待窑干复测'),('BZ-606-20261120','待模型确认的高湿批次')]:
      cur.execute('SELECT id FROM bamboo_lots WHERE lot_code=%s',(code,)); lid=cur.fetchone()[0]
      cur.execute("INSERT INTO anomaly_lots(lot_id,status,reason) VALUES(%s,'OPEN',%s) ON CONFLICT(lot_id) DO NOTHING",(lid,reason)); cur.execute("UPDATE bamboo_lots SET status='QUARANTINED' WHERE id=%s",(lid,))
+    # —— 产地连续异常预警演示（幂等：已有判定的批次不重复登记）——
+    from src.services.alerts import record_inspection
+    def demo_lot(code,origin,day,kg,target):
+     cur.execute("INSERT INTO bamboo_lots(lot_code,origin,harvest_date,species,weight_kg,target_moisture,status,operator_id) VALUES(%s,%s,%s,'毛竹',%s,%s,'RECEIVED',1) ON CONFLICT(lot_code) DO NOTHING RETURNING id",(code,origin,day,kg,target))
+     r=cur.fetchone()
+     if r: return r[0]
+     cur.execute('SELECT id FROM bamboo_lots WHERE lot_code=%s',(code,)); return cur.fetchone()[0]
+    def judged(lid):
+     cur.execute('SELECT 1 FROM initial_inspections WHERE lot_id=%s LIMIT 1',(lid,)); return cur.fetchone() is not None
+    # 场景1：广西融安连续 3 批初检异常 -> 一张待确认预警单
+    s1=[demo_lot(*x) for x in [('BZ-621-20261121','广西融安','2026-11-21',810,14),('BZ-622-20261121','广西融安','2026-11-21',795,14),('BZ-623-20261121','广西融安','2026-11-21',830,14)]]
+    if all(not judged(l) for l in s1):
+     for l in s1: record_inspection(c,l,'ABNORMAL','SEED',None,'seed：MT-07 初检高湿')
+    # 场景2：湖南绥宁 2 批异常 + 1 批未判 -> 盯防中，未判批次先等
+    s2=[demo_lot(*x) for x in [('BZ-631-20261121','湖南绥宁','2026-11-21',760,15),('BZ-632-20261121','湖南绥宁','2026-11-21',705,15),('BZ-633-20261121','湖南绥宁','2026-11-21',720,15)]]
+    if not judged(s2[0]): record_inspection(c,s2[0],'ABNORMAL','SEED',None,'seed：MT-07 初检高湿')
+    if not judged(s2[1]): record_inspection(c,s2[1],'ABNORMAL','SEED',None,'seed：MT-07 初检高湿')
+    # 场景3：江西宜春 3 连异常 -> 主管已确认；中间批重做初检推翻 -> 挂一条更正
+    s3=[demo_lot(*x) for x in [('BZ-641-20261121','江西宜春','2026-11-21',880,14),('BZ-642-20261121','江西宜春','2026-11-21',865,14),('BZ-643-20261121','江西宜春','2026-11-21',890,14)]]
+    if all(not judged(l) for l in s3):
+     for l in s3: record_inspection(c,l,'ABNORMAL','SEED',None,'seed：MT-07 初检高湿')
+     cur.execute("UPDATE origin_alerts SET status='CONFIRMED',confirmed_by=(SELECT id FROM users WHERE username='supervisor'),confirmed_at=now() WHERE origin='江西宜春' AND status='OPEN'")
+     record_inspection(c,s3[1],'NORMAL','SEED',None,'seed：重做初检，以最后送检结论为准')
   print('seed_demo: idempotent seed complete'); break
  except Exception:
   if attempt==29: raise

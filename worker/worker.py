@@ -1,9 +1,10 @@
-import os,json,time,hashlib,traceback,psycopg2,redis,numpy as np
+import os,json,time,hashlib,traceback,urllib.request,psycopg2,redis,numpy as np
 from datetime import datetime,timezone
 from psycopg2.extras import RealDictCursor,Json
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 DB=os.getenv('DATABASE_URL','postgresql://bamboo:bamboo_dev_password@db:5432/bamboo'); R=redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0'),decode_responses=True)
+BACKEND=os.getenv('BACKEND_INTERNAL_URL','http://backend:8000'); TOKEN=os.getenv('INTERNAL_TOKEN','gb1075-internal')
 Q='bamboo:moisture-analysis'
 def db():
  for _ in range(30):
@@ -15,6 +16,14 @@ def vec(v):
 def detect(refs,vals):
  scaler=StandardScaler(); rs=scaler.fit_transform(np.array(refs,float)); x=scaler.transform(np.array(vec(vals)).reshape(1,-1)); m=OneClassSVM(kernel='rbf',gamma='scale',nu=.2);m.fit(rs);pred=int(m.predict(x)[0]);score=float(m.decision_function(x)[0]);dist=float(np.linalg.norm(x[0]));out={'seed':1075,'reference_count':len(refs),'vector':vec(vals),'prediction':pred,'decision_score':round(score,6),'standardized_distance':round(dist,6),'is_anomaly':pred==-1 or dist>=2.25};out['checksum']=hashlib.sha256(json.dumps(out,sort_keys=True).encode()).hexdigest()[:16];return out
 def heartbeat():open('/shared/worker.heartbeat','w').write(datetime.now(timezone.utc).isoformat())
+def notify(lot_id,conclusion,job_id):
+ # 把初检结论交给后端登记并重算产地预警；job_id 幂等，重试不重复开单
+ payload=json.dumps({'lot_id':lot_id,'conclusion':conclusion,'job_id':job_id,'notes':'模型初检结论'}).encode()
+ req=urllib.request.Request(BACKEND+'/internal/inspections',data=payload,headers={'Content-Type':'application/json','X-Internal-Token':TOKEN})
+ for _ in range(3):
+  try:urllib.request.urlopen(req,timeout=5).read();return
+  except Exception:traceback.print_exc();time.sleep(2)
+ print(f'notify backend failed for job {job_id}',flush=True)
 def process(jid):
  c=db(); c.autocommit=True; cur=c.cursor(cursor_factory=RealDictCursor); cur.execute('SELECT * FROM analysis_jobs WHERE id=%s',(jid,)); job=cur.fetchone()
  if not job or job['status']=='SUCCEEDED':c.close();return
@@ -26,7 +35,7 @@ def process(jid):
    else:cur.execute("INSERT INTO anomaly_lots(lot_id,status,reason,decision_score,standardized_distance,model_checksum) VALUES(%s,'OPEN','OneClassSVM识别为高湿异常，需窑干复测',%s,%s,%s)",(job['lot_id'],out['decision_score'],out['standardized_distance'],out['checksum']))
    cur.execute("UPDATE bamboo_lots SET status='QUARANTINED' WHERE id=%s",(job['lot_id'],))
   else:cur.execute("UPDATE bamboo_lots SET status='CLEARED' WHERE id=%s",(job['lot_id'],))
-  c.close()
+  c.close(); notify(job['lot_id'],'ABNORMAL' if out['is_anomaly'] else 'NORMAL',jid)
  except Exception as e:
   c=db();c.autocommit=True;c.cursor().execute("UPDATE analysis_jobs SET status='FAILED',error=%s,finished_at=now() WHERE id=%s",(str(e),jid));c.close();traceback.print_exc()
 heartbeat()

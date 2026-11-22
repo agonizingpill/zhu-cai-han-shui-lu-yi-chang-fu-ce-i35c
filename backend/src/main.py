@@ -1,12 +1,13 @@
 import json, os
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .utils.db import conn, one, all_rows
 from .utils.security import hp, token, user, roles
-from .config.settings import MIN_SAMPLE_POINTS
+from .config.settings import MIN_SAMPLE_POINTS, INTERNAL_TOKEN
 from .services.queue import put
+from .services.alerts import record_inspection, list_alerts, watchlist, confirm_alert
 from .middlewares.audit import AuditMiddleware
 from .middlewares.rate_limit import RateLimitMiddleware
 
@@ -21,12 +22,16 @@ class SampleIn(BaseModel): point_code:str; moisture_pct:float=Field(ge=0,le=100)
 class ScheduleIn(BaseModel): kiln_code:str; scheduled_start:str; scheduled_end:str
 class ResultIn(BaseModel): post_moisture:float=Field(ge=0,le=100); result:str; notes:str=''
 class ReleaseIn(BaseModel): decision:str; reason:str
+class InspectionIn(BaseModel): conclusion:str; notes:str=''
+class ConfirmIn(BaseModel): basis_hash:str
+class InternalInspectionIn(BaseModel): lot_id:int; conclusion:str; job_id:int|None=None; notes:str=''
 
 def detail(lot_id):
     l=one('SELECT * FROM bamboo_lots WHERE id=%s',(lot_id,))
     if not l: raise HTTPException(404,'竹材批次不存在')
     ss=all_rows('SELECT * FROM moisture_samples WHERE lot_id=%s ORDER BY point_code',(lot_id,)); a=one('SELECT * FROM anomaly_lots WHERE lot_id=%s',(lot_id,))
-    return {'lot':dict(l),'samples':[dict(x) for x in ss],'anomaly':dict(a) if a else None}
+    ins=all_rows('SELECT id,conclusion,source,job_id,notes,submitted_at FROM initial_inspections WHERE lot_id=%s ORDER BY submitted_at DESC,id DESC',(lot_id,))
+    return {'lot':dict(l),'samples':[dict(x) for x in ss],'anomaly':dict(a) if a else None,'inspections':[dict(x) for x in ins]}
 
 def reference_vectors(exclude):
     rows=all_rows("SELECT l.id,array_agg(s.moisture_pct ORDER BY s.point_code) vals FROM bamboo_lots l JOIN moisture_samples s ON s.lot_id=l.id LEFT JOIN anomaly_lots a ON a.lot_id=l.id WHERE l.id<>%s AND a.id IS NULL GROUP BY l.id HAVING count(s.id)>=%s",(exclude,MIN_SAMPLE_POINTS))
@@ -144,3 +149,33 @@ def release(lot_id:int,d:ReleaseIn,u=Depends(roles('supervisor'))):
             cur.execute('INSERT INTO release_decisions(lot_id,anomaly_id,decision,reason,decided_by) VALUES(%s,%s,%s,%s,%s)',(lot_id,a['id'] if a else None,d.decision,d.reason,u['id']))
             cur.execute("UPDATE bamboo_lots SET status=%s WHERE id=%s",('RELEASED' if d.decision=='RELEASE' else 'QUARANTINED',lot_id))
     return {'lot_id':lot_id,'decision':d.decision}
+
+@app.post('/lots/{lot_id}/inspections')
+def add_inspection(lot_id:int,d:InspectionIn,u=Depends(roles('operator','supervisor'))):
+    if d.conclusion not in ('ABNORMAL','NORMAL'): raise HTTPException(422,'结论必须是 ABNORMAL（异常）或 NORMAL（正常）')
+    with conn() as c:
+        try: ins,lot,actions=record_inspection(c,lot_id,d.conclusion,'MANUAL',None,d.notes,u['id'])
+        except KeyError: raise HTTPException(404,'批次不存在')
+    return {'inspection':ins,'origin':lot['origin'],'alert_created':any(a['type']=='create' for a in actions),'actions':[a['type'] for a in actions]}
+
+@app.get('/alerts')
+def alerts(u=Depends(roles('operator','supervisor','viewer'))):
+    with conn() as c: return {'alerts':list_alerts(c),'watch':watchlist(c)}
+
+@app.post('/alerts/{aid}/confirm')
+def confirm(aid:int,d:ConfirmIn,u=Depends(roles('supervisor'))):
+    with conn() as c: res=confirm_alert(c,aid,d.basis_hash,u['id'])
+    if res=='missing': raise HTTPException(404,'预警单不存在')
+    if res=='not_open': raise HTTPException(409,'预警单已处理，请刷新总览')
+    if res=='withdrawn': raise HTTPException(409,'连续异常依据已不成立，预警单已撤回，请刷新总览')
+    if res=='stale': raise HTTPException(409,'预警依据已变化，请重新核对后再确认')
+    return {'id':aid,'status':'CONFIRMED'}
+
+@app.post('/internal/inspections')
+def internal_inspection(d:InternalInspectionIn,x_internal_token:str=Header('')):
+    if x_internal_token!=INTERNAL_TOKEN: raise HTTPException(401,'内部令牌无效')
+    if d.conclusion not in ('ABNORMAL','NORMAL'): raise HTTPException(422,'结论必须是 ABNORMAL 或 NORMAL')
+    with conn() as c:
+        try: ins,lot,actions=record_inspection(c,d.lot_id,d.conclusion,'ANALYSIS',d.job_id,d.notes)
+        except KeyError: raise HTTPException(404,'批次不存在')
+    return {'recorded':bool(ins)}

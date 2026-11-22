@@ -6,3 +6,11 @@ CREATE TABLE IF NOT EXISTS kiln_rechecks(id SERIAL PRIMARY KEY,anomaly_id INT RE
 CREATE TABLE IF NOT EXISTS release_decisions(id SERIAL PRIMARY KEY,lot_id INT REFERENCES bamboo_lots(id) ON DELETE CASCADE,anomaly_id INT REFERENCES anomaly_lots(id),decision TEXT NOT NULL,reason TEXT NOT NULL,decided_by INT REFERENCES users(id),decided_at TIMESTAMPTZ DEFAULT now());
 CREATE TABLE IF NOT EXISTS analysis_jobs(id SERIAL PRIMARY KEY,lot_id INT REFERENCES bamboo_lots(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'QUEUED',input_summary JSONB NOT NULL,result JSONB,error TEXT,created_at TIMESTAMPTZ DEFAULT now(),finished_at TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS audit_logs(id SERIAL PRIMARY KEY,action TEXT NOT NULL,path TEXT,method TEXT,status_code INT,created_at TIMESTAMPTZ DEFAULT now());
+-- 初检判定记录：同一批次可多次送检（重做/晚到），有效结论以最后送检为准
+CREATE TABLE IF NOT EXISTS initial_inspections(id SERIAL PRIMARY KEY,lot_id INT NOT NULL REFERENCES bamboo_lots(id) ON DELETE CASCADE,conclusion TEXT NOT NULL CHECK(conclusion IN ('ABNORMAL','NORMAL')),source TEXT NOT NULL DEFAULT 'MANUAL',job_id INT UNIQUE,notes TEXT NOT NULL DEFAULT '',submitted_at TIMESTAMPTZ NOT NULL DEFAULT now(),created_by INT REFERENCES users(id));
+CREATE INDEX IF NOT EXISTS idx_initial_inspections_lot ON initial_inspections(lot_id,submitted_at DESC);
+-- 产地连续异常预警单：同一产地按入库先后连续三批初检异常开一单，每段只开一单
+CREATE TABLE IF NOT EXISTS origin_alerts(id SERIAL PRIMARY KEY,origin TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','CONFIRMED','WITHDRAWN')),basis JSONB NOT NULL,basis_hash TEXT NOT NULL,opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),confirmed_by INT REFERENCES users(id),confirmed_at TIMESTAMPTZ,withdraw_reason TEXT);
+CREATE INDEX IF NOT EXISTS idx_origin_alerts_origin ON origin_alerts(origin,status);
+-- 已确认预警的更正：依据被后续判定推翻/段变化时挂账，确认时的快照不改
+CREATE TABLE IF NOT EXISTS origin_alert_corrections(id SERIAL PRIMARY KEY,alert_id INT NOT NULL REFERENCES origin_alerts(id) ON DELETE CASCADE,detail TEXT NOT NULL,snapshot JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now());

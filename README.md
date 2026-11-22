@@ -15,6 +15,30 @@
 - 异常批次 `AnomalyLot`：持久化 OneClassSVM 判定、标准化距离、模型 checksum 和隔离状态。
 - 窑干复测 `KilnRecheck`：记录窑位时间窗，冲突时创建 `RESCHEDULED` 版本并保留原排程。
 - 出库放行 `ReleaseDecision`：只有 supervisor 能盖章，异常复测未闭环时后端拒绝放行。
+- 初检判定 `InitialInspection`：每批可多次送检（人工登记 / 模型初检），有效结论以最后送检为准；晚到的判定按原入库位置参与重算。
+- 产地预警 `OriginAlert`：同一产地按入库先后连续三批初检判异常即开一张预警单，每段只开一单。
+- 预警更正 `OriginAlertCorrection`：已确认预警的依据被后续判定推翻或段发生变化时挂账，确认时的快照不改。
+
+## 产地连续异常预警口径
+
+- 序列：同一产地的批次按 `received_at`（入库先后，同刻按批次 id）排列；每批的当前结论取 `initial_inspections` 中最后送检的一条。
+- 开单：序列中连续 3 批 `ABNORMAL` 构成一段，开一张 `OPEN` 预警单；段延伸（第 4、5 批连上）沿用原单，重算与重试不重复开单。
+- 先等：未判批次截断"已确认连续"，既不计入也不永久打断；判定到达（含晚到）后按原入库位置整列重算。
+- 撤回：`OPEN` 单的依据随重算实时更新；连续段不再成立时自动撤回并记录原因。
+- 确认：supervisor 在总览页核对依据后确认，请求携带看到的 `basis_hash`；若确认时依据已变，后端返回 409 请其重新核对。
+- 冻结与更正：`CONFIRMED` 单冻结当时的批次与判定；之后结论被推翻、段延伸/收缩或恢复一致，都各挂一条更正。
+- 上报幂等：worker 的模型初检结论按 `analysis_job id` 幂等登记（`initial_inspections.job_id` 唯一），重试不重复记录、不重复开单。
+
+## 预警相关接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/lots/{id}/inspections` | 登记初检判定（operator/supervisor），随后整产地重算 |
+| GET | `/alerts` | 预警单列表（含依据与更正）+ 盯防清单 |
+| POST | `/alerts/{id}/confirm` | 主管确认，body 带 `basis_hash`，依据已变返回 409 |
+| POST | `/internal/inspections` | worker 上报模型初检结论，需 `X-Internal-Token` |
+
+seed 预置三个演示场景：广西融安 3 连异常（一张待确认单）、湖南绥宁 2 连异常 + 1 批待判（盯防中）、江西宜春 3 连异常已确认后中间批被推翻（挂更正）。
 
 ## 算法口径
 
@@ -40,7 +64,7 @@ docker compose up -d --build
 
 ## 枚举位置
 
-后端枚举在 `backend/src/constants/enums.py`，前端枚举在 `frontend/src/constants/enums.js`。具体状态前置条件在 `backend/src/main.py` 的入库、采样、分析、排程、复测和放行路由中。
+后端枚举在 `backend/src/constants/enums.py`，前端枚举在 `frontend/src/constants/enums.js`。具体状态前置条件在 `backend/src/main.py` 的入库、采样、分析、排程、复测和放行路由中。预警引擎为纯函数，位于 `backend/src/services/streaks.py`（单元测试 `backend/tests/test_streaks.py`，可用 `python3 backend/tests/test_streaks.py` 直接运行），落库与重算在 `backend/src/services/alerts.py`。
 
 ## 技术栈与目录
 
